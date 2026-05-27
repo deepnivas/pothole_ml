@@ -1,0 +1,19 @@
+# ─── Core ML Stack ───────────────────────────────────────────────────────────
+--extra-index-url https://pytorch.org
+torch>=2.4.0
+torchvision>=0.19.0
+timm>=1.0.3
+
+# ─── Computer Vision ─────────────────────────────────────────────────────────
+albumentations>=1.4.11
+Pillow>=10.3.0
+opencv-python-headless>=4.10.0.84
+
+# ─── Numerical & Signal Processing ───────────────────────────────────────────
+numpy>=2.0.0
+scipy>=1.13.1
+pandas>=2.2.2
+scikit-learn>=1.5.0
+
+# ─── Logging & Experiment Tracking ───────────────────────────────────────────
+tensorboard>=2.17.0
