@@ -1,25 +1,18 @@
 """
 ================================================================================
- MULTIMODAL POTHOLE SEVERITY SCORING SYSTEM
- Fusing ESP32-CAM Vision + IMU Telemetry via Cross-Attention
- Architecture: ConvNeXt-Tiny + Temporal IMU Encoder + Cross-Attention Fusion
- Output: Continuous severity score in [1.0, 10.0]
+ POTHOLE CNN CLASSIFIER
+ Image-only pothole detector built on a ConvNeXt-Tiny backbone.
+
+ This version removes the IMU fusion path and trains on image-level labels:
+     data/
+         images/          ← JPG/PNG files
+         labels.csv       ← columns: image_file,label
+     checkpoints/       ← saved model weights
+     logs/              ← TensorBoard logs
+
+ Supported labels:
+     0 / 1, false / true, no_pothole / pothole, negative / positive
 ================================================================================
-
-DIRECTORY STRUCTURE EXPECTED:
-  data/
-    images/          ← JPG files, named as <timestamp>.jpg or <index>.jpg
-    telemetry.csv    ← columns: timestamp, ax, ay, az, gx, gy, gz
-  checkpoints/       ← saved model weights
-  logs/              ← TensorBoard logs
-
-CSV FORMAT:
-  timestamp,ax,ay,az,gx,gy,gz,severity_label
-  (severity_label is optional at inference; required for training)
-
-IMAGE FILENAME FORMATS SUPPORTED:
-  - <unix_timestamp>.jpg   e.g.  1718000123456.jpg
-  - <index>.jpg            e.g.  0042.jpg
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -43,12 +36,13 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.cuda.amp import GradScaler, autocast
 
-import timm                          # pip install timm
 from PIL import Image
 import albumentations as A           # pip install albumentations
 from albumentations.pytorch import ToTensorV2
+import torchvision.models as tv_models
 
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 from sklearn.preprocessing import RobustScaler
 
 try:
@@ -72,30 +66,23 @@ log = logging.getLogger(__name__)
 class Config:
     # Paths
     data_dir:        str  = "data"
-    image_dir:       str  = r"C:\Users\E028.28\Downloads\archive (2)\images"
-    telemetry_csv:   str  = "data/telemetry.csv"
+    image_dir:       str  = "data/images"
+    labels_csv:      str  = "data/labels.csv"
     checkpoint_dir:  str  = "checkpoints"
     log_dir:         str  = "logs"
 
-    # IMU windowing
-    imu_window_size: int  = 50        # samples around the trigger event
-    imu_step:        int  = 1         # stride for sliding window features
-    fft_bins:        int  = 32        # FFT frequency bins to keep
-
     # Vision backbone
-    vision_model:    str  = "convnext_tiny.in12k_ft_in1k"   # timm model name
+    vision_model:    str  = "resnet18"   # local torchvision backbone
     img_size:        int  = 256
     freeze_backbone: bool = False     # fine-tune entire backbone
+    threshold:       float = 0.5
 
     # Architecture dims
     vision_embed_dim: int = 256
-    imu_embed_dim:    int = 128
-    fusion_dim:       int = 256
-    num_heads:        int = 8
     dropout:          float = 0.2
 
     # Training
-    epochs:          int   = 150
+    epochs:          int   = 30
     batch_size:      int   = 16
     lr:              float = 2e-4
     weight_decay:    float = 1e-4
@@ -104,12 +91,6 @@ class Config:
     T0:              int   = 10       # CosineAnnealingWarmRestarts T_0
     T_mult:          int   = 2
 
-    # Loss
-    loss_type:       str   = "wing"   # "wing" | "huber" | "focal_mse"
-    wing_w:          float = 10.0
-    wing_epsilon:    float = 2.0
-    huber_delta:     float = 1.0
-
     # Misc
     seed:            int   = 42
     num_workers:     int   = 0
@@ -117,10 +98,7 @@ class Config:
     use_amp:         bool  = True     # automatic mixed precision
     val_split:       float = 0.15
     test_split:      float = 0.10
-
-    # Severity range
-    score_min:       float = 1.0
-    score_max:       float = 10.0
+    class_names:     Tuple[str, str] = ("NO_POTHOLE", "POTHOLE")
 
 
 CFG = Config()
@@ -138,6 +116,18 @@ def seed_everything(seed: int):
     torch.backends.cudnn.benchmark     = False
 
 seed_everything(CFG.seed)
+
+
+def get_best_device(prefer_mps: bool = True) -> torch.device:
+    if prefer_mps and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def device_supports_amp(device: torch.device) -> bool:
+    return device.type == "cuda"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -319,105 +309,79 @@ def inject_sensor_noise(
 # ──────────────────────────────────────────────────────────────────────────────
 # 6.  CUSTOM DATASET
 # ──────────────────────────────────────────────────────────────────────────────
-class PotholeDataset(Dataset):
-    """
-    Multimodal dataset that pairs:
-      • A triggered JPG image  → visual modality
-      • A window of IMU rows   → kinematic modality
-      • A severity score       → regression target [1.0, 10.0]
+def normalize_binary_label(value) -> int:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "positive", "pothole", "damaged"}:
+            return 1
+        if normalized in {"0", "false", "no", "negative", "no_pothole", "clear", "normal"}:
+            return 0
+        try:
+            return int(float(normalized) > 0.5)
+        except ValueError:
+            raise ValueError(f"Unsupported label value: {value}")
+    return int(float(value) > 0.5)
 
-    The IMU window is centred on the trigger event row, with
-    `imu_window_size // 2` rows before and after.
-    """
+
+def infer_label_from_path(path: Path) -> Optional[int]:
+    parts = {part.lower() for part in path.parts}
+    if {"pothole", "positive", "damaged"} & parts:
+        return 1
+    if {"no_pothole", "normal", "negative", "clear"} & parts:
+        return 0
+    return None
+
+
+class PotholeDataset(Dataset):
+    """Image-only pothole dataset for binary classification."""
 
     def __init__(
         self,
-        df:          pd.DataFrame,
-        image_dir:   str,
-        imu_extractor: IMUFeatureExtractor,
+        df: pd.DataFrame,
+        image_dir: str,
         transform,
-        cfg:         Config,
-        is_train:    bool = True,
+        cfg: Config,
+        is_train: bool = True,
     ):
-        self.df            = df.reset_index(drop=True)
-        self.image_dir     = Path(image_dir)
-        self.extractor     = imu_extractor
-        self.transform     = transform
-        self.cfg           = cfg
-        self.is_train      = is_train
+        self.df = df.reset_index(drop=True)
+        self.image_dir = Path(image_dir)
+        self.transform = transform
+        self.cfg = cfg
+        self.is_train = is_train
 
-        # Pre-load full telemetry array for fast window slicing
-        self.imu_cols = ["ax", "ay", "az", "gx", "gy", "gz"]
-        self.all_imu  = df[self.imu_cols].values.astype(np.float32)
-
-    # ------------------------------------------------------------------
     def __len__(self) -> int:
         return len(self.df)
 
-    # ------------------------------------------------------------------
-    def _get_imu_window(self, idx: int) -> np.ndarray:
-        half = self.cfg.imu_window_size // 2
-        lo   = max(0, idx - half)
-        hi   = min(len(self.all_imu), idx + half)
-        window = self.all_imu[lo:hi]
-        # Pad to fixed length if at boundaries
-        if len(window) < self.cfg.imu_window_size:
-            pad_needed = self.cfg.imu_window_size - len(window)
-            window = np.vstack([
-                window,
-                np.zeros((pad_needed, window.shape[1]), dtype=np.float32)
-            ])
-        return window
+    def _resolve_image_path(self, row: pd.Series) -> Path:
+        candidates: List[Path] = []
+        for key in ("image_file", "image", "filename", "path"):
+            value = row.get(key, None)
+            if isinstance(value, str) and value.strip():
+                candidate = Path(value)
+                candidates.append(candidate if candidate.is_absolute() else self.image_dir / candidate)
+                candidates.append(self.image_dir / value)
 
-    # ------------------------------------------------------------------
-    def _resolve_image_path(self, row) -> Optional[Path]:
-        """
-        Supports images named by timestamp or by integer index.
-        Falls back gracefully to a black image if not found.
-        """
-        candidates = []
-        if "image_file" in self.df.columns and pd.notna(row.get("image_file", None)):
-            candidates.append(self.image_dir / row["image_file"])
-        if "timestamp" in self.df.columns:
-            candidates.append(self.image_dir / f"{int(row['timestamp'])}.jpg")
-        if "index" in self.df.columns or True:
-            candidates.append(self.image_dir / f"{row.name:04d}.jpg")
-        for p in candidates:
-            if p.exists():
-                return p
-        return None
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
 
-    # ------------------------------------------------------------------
+        raise FileNotFoundError(
+            f"Could not resolve image for row {row.name}. Tried: {', '.join(str(p) for p in candidates[:3])}"
+        )
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         row = self.df.iloc[idx]
-
-        # ── Visual modality ───────────────────────────────────────────
         img_path = self._resolve_image_path(row)
-        if img_path is not None:
-            img = np.array(Image.open(img_path).convert("RGB"))
-        else:
-            # Black image fallback for missing files
-            img = np.zeros((self.cfg.img_size, self.cfg.img_size, 3), dtype=np.uint8)
+        img = np.array(Image.open(img_path).convert("RGB"))
+        image = self.transform(image=img)["image"]
 
-        img_tensor = self.transform(image=img)["image"]   # (3, H, W) float32
-
-        # ── IMU modality ──────────────────────────────────────────────
-        window      = self._get_imu_window(idx)
-        imu_feats   = self.extractor.extract(window)      # (D,) float32
-        imu_tensor  = torch.from_numpy(imu_feats)
-
-        if self.is_train:
-            imu_tensor = inject_sensor_noise(imu_tensor)
-
-        # ── Target ───────────────────────────────────────────────────
-        severity = float(row.get("severity_label", 0.0))
-        severity = np.clip(severity, self.cfg.score_min, self.cfg.score_max)
-        target   = torch.tensor(severity, dtype=torch.float32)
+        label_value = row.get("label", row.get("severity_label", row.get("target", 0)))
+        label = torch.tensor(normalize_binary_label(label_value), dtype=torch.float32)
 
         return {
-            "image":    img_tensor,
-            "imu":      imu_tensor,
-            "severity": target,
+            "image": image,
+            "label": label,
+            "image_path": str(img_path),
         }
 
 
@@ -426,35 +390,28 @@ class PotholeDataset(Dataset):
 # ──────────────────────────────────────────────────────────────────────────────
 class VisionEncoder(nn.Module):
     """
-    ConvNeXt-Tiny backbone with a projection head.
+    Local torchvision ResNet18 backbone with a projection head.
 
-    Why ConvNeXt-Tiny over ViT for ESP32-CAM:
-      • Handles low-resolution (224²) images more gracefully than ViT-B/16
-      • ~28M params — strong features without over-fitting on small datasets
-      • ConvNeXt's depthwise separable design captures local texture well,
-        which is critical for crack/pothole texture recognition
-      • Alternative: EfficientNetV2-S (swap model name in Config)
+    This avoids any external weight download and keeps the entire model local.
     """
 
     def __init__(self, cfg: Config):
         super().__init__()
-        self.backbone = timm.create_model(
-            cfg.vision_model,
-            pretrained=True,
-            num_classes=0,     # strip classifier head; return feature map
-            global_pool="avg", # global average pool → (B, C)
-        )
-        backbone_dim = self.backbone.num_features
+        if cfg.vision_model != "resnet18":
+            log.warning("vision_model=%s is ignored; using local resnet18 backbone", cfg.vision_model)
+
+        self.backbone = tv_models.resnet18(weights=None)
+        backbone_dim = self.backbone.fc.in_features
+        self.backbone.fc = nn.Identity()
 
         if not cfg.freeze_backbone:
             # Unfreeze all — fine-tune end-to-end
             for p in self.backbone.parameters():
                 p.requires_grad = True
         else:
-            # Freeze all but last two stages
-            for name, p in self.backbone.named_parameters():
-                if "stages.3" not in name and "stages.2" not in name:
-                    p.requires_grad = False
+            # Freeze the backbone and train only the projection head
+            for p in self.backbone.parameters():
+                p.requires_grad = False
 
         self.proj = nn.Sequential(
             nn.Linear(backbone_dim, cfg.vision_embed_dim * 2),
@@ -572,157 +529,74 @@ class CrossAttentionFusion(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 10. FULL MULTIMODAL POTHOLE NETWORK
+# 10. FULL IMAGE-ONLY POTHOLE NETWORK
 # ──────────────────────────────────────────────────────────────────────────────
 class PotholeNet(nn.Module):
-    """
-    End-to-end multimodal severity regression network.
+    """ConvNeXt-Tiny image classifier for pothole detection."""
 
-    Forward pass:
-      image (B,3,H,W) ──► VisionEncoder  ──► (B, V)  ─┐
-                                                        ├─► CrossAttentionFusion ──► Regressor ──► score (B,)
-      imu   (B, D)    ──► IMUEncoder     ──► (B, I)  ─┘
-
-    Output activation: scaled sigmoid → [1.0, 10.0]
-      score = 1.0 + 9.0 * sigmoid(logit)
-    """
-
-    def __init__(self, imu_feature_dim: int, cfg: Config):
+    def __init__(self, cfg: Config):
         super().__init__()
         self.vision_enc = VisionEncoder(cfg)
-        self.imu_enc    = IMUEncoder(imu_feature_dim, cfg)
-        self.fusion     = CrossAttentionFusion(cfg)
-
-        # Regression head
-        self.regressor = nn.Sequential(
-            nn.Linear(cfg.fusion_dim, 128),
+        self.classifier = nn.Sequential(
+            nn.Linear(cfg.vision_embed_dim, 128),
             nn.GELU(),
-            nn.Dropout(cfg.dropout / 2),
-            nn.Linear(128, 32),
-            nn.GELU(),
-            nn.Linear(32, 1),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(128, 1),
         )
-
-        self.score_min = cfg.score_min
-        self.score_max = cfg.score_max
         self._init_weights()
 
-    # ------------------------------------------------------------------
     def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.trunc_normal_(m.weight, std=0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.trunc_normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
-    # ------------------------------------------------------------------
-    def forward(
-        self,
-        image: torch.Tensor,   # (B, 3, H, W)
-        imu:   torch.Tensor,   # (B, D)
-    ) -> torch.Tensor:
-        v     = self.vision_enc(image)            # (B, V)
-        i     = self.imu_enc(imu)                 # (B, I)
-        fused = self.fusion(v, i)                 # (B, F)
-        logit = self.regressor(fused).squeeze(-1) # (B,)
-
-        # Scale sigmoid output to [score_min, score_max]
-        score = (
-            self.score_min
-            + (self.score_max - self.score_min) * torch.sigmoid(logit)
-        )
-        return score
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        features = self.vision_enc(image)
+        logits = self.classifier(features).squeeze(-1)
+        return logits
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 11. LOSS FUNCTIONS
 # ──────────────────────────────────────────────────────────────────────────────
-class WingLoss(nn.Module):
-    """
-    Wing Loss (Feng et al., 2018) — originally for facial landmark detection,
-    highly effective for ordinal regression with rare extreme values.
-
-    Compared to MSE/MAE:
-      • Large gradient for small errors (improves fine-grained accuracy)
-      • Logarithmic penalty for large errors (robustness to outliers/rare classes)
-
-    Perfect for pothole scoring: common 3–5 bumps get tight loss;
-    rare 8–10 craters don't overwhelm the gradient.
-    """
-
-    def __init__(self, w: float = 10.0, epsilon: float = 2.0):
-        super().__init__()
-        self.w       = w
-        self.epsilon = epsilon
-        self.C       = w - w * math.log(1 + w / epsilon)
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        diff = torch.abs(pred - target)
-        loss = torch.where(
-            diff < self.w,
-            self.w * torch.log(1 + diff / self.epsilon),
-            diff - self.C,
-        )
-        return loss.mean()
-
-
-class FocalMSELoss(nn.Module):
-    """
-    Focal MSE: downweights easy (common) examples, upweights hard (rare) ones.
-    gamma > 0 increasingly focuses on high-severity rare potholes.
-    """
-
-    def __init__(self, gamma: float = 2.0, score_min: float = 1.0, score_max: float = 10.0):
-        super().__init__()
-        self.gamma     = gamma
-        self.score_min = score_min
-        self.score_max = score_max
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        mse    = (pred - target) ** 2
-        # Weight by normalized severity — rare high scores get higher weight
-        weight = ((target - self.score_min) / (self.score_max - self.score_min)) ** self.gamma
-        return (weight * mse).mean()
-
-
-def build_loss(cfg: Config) -> nn.Module:
-    if cfg.loss_type == "wing":
-        return WingLoss(w=cfg.wing_w, epsilon=cfg.wing_epsilon)
-    elif cfg.loss_type == "huber":
-        return nn.HuberLoss(delta=cfg.huber_delta)
-    elif cfg.loss_type == "focal_mse":
-        return FocalMSELoss(score_min=cfg.score_min, score_max=cfg.score_max)
-    else:
-        raise ValueError(f"Unknown loss_type: {cfg.loss_type}")
+def build_loss(pos_weight: Optional[torch.Tensor] = None) -> nn.Module:
+    if pos_weight is not None:
+        return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    return nn.BCEWithLogitsLoss()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 12. METRICS
 # ──────────────────────────────────────────────────────────────────────────────
-def compute_metrics(preds: np.ndarray, targets: np.ndarray) -> Dict[str, float]:
-    mae  = np.mean(np.abs(preds - targets))
-    rmse = np.sqrt(np.mean((preds - targets) ** 2))
-    # Within-1 accuracy: % predictions within ±1.0 of true score
-    w1   = np.mean(np.abs(preds - targets) <= 1.0) * 100.0
-    # Rank correlation (Spearman)
-    from scipy.stats import spearmanr
-    rho, _ = spearmanr(preds, targets)
-    return {"MAE": mae, "RMSE": rmse, "Within1%": w1, "SpearmanRho": rho}
+def compute_metrics(logits: np.ndarray, targets: np.ndarray, threshold: float = 0.5) -> Dict[str, float]:
+    probs = 1.0 / (1.0 + np.exp(-logits))
+    preds = (probs >= threshold).astype(np.int32)
+    targets = targets.astype(np.int32)
+
+    metrics = {
+        "Accuracy": accuracy_score(targets, preds),
+        "Precision": precision_score(targets, preds, zero_division=0),
+        "Recall": recall_score(targets, preds, zero_division=0),
+        "F1": f1_score(targets, preds, zero_division=0),
+    }
+    try:
+        metrics["AUC"] = roc_auc_score(targets, probs)
+    except ValueError:
+        metrics["AUC"] = float("nan")
+    return metrics
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 13. WEIGHTED SAMPLER  (handles class imbalance for rare severe potholes)
 # ──────────────────────────────────────────────────────────────────────────────
-def build_weighted_sampler(labels: np.ndarray, n_bins: int = 9) -> WeightedRandomSampler:
-    """
-    Discretize continuous scores into bins and over-sample rare high-severity bins.
-    """
-    bins         = np.linspace(1.0, 10.0, n_bins + 1)
-    bin_indices  = np.digitize(labels, bins) - 1
-    bin_indices  = np.clip(bin_indices, 0, n_bins - 1)
-    bin_counts   = np.bincount(bin_indices, minlength=n_bins).astype(np.float32)
-    bin_counts   = np.where(bin_counts == 0, 1.0, bin_counts)
-    weights      = 1.0 / bin_counts[bin_indices]
+def build_weighted_sampler(labels: np.ndarray) -> WeightedRandomSampler:
+    """Over-sample the minority class for binary classification."""
+    labels = labels.astype(np.int32)
+    class_counts = np.bincount(labels, minlength=2).astype(np.float32)
+    class_counts = np.where(class_counts == 0, 1.0, class_counts)
+    weights = 1.0 / class_counts[labels]
     return WeightedRandomSampler(
         weights=torch.from_numpy(weights).float(),
         num_samples=len(weights),
@@ -733,72 +607,86 @@ def build_weighted_sampler(labels: np.ndarray, n_bins: int = 9) -> WeightedRando
 # ──────────────────────────────────────────────────────────────────────────────
 # 14. DATA LOADING
 # ──────────────────────────────────────────────────────────────────────────────
-def load_data(cfg: Config) -> Tuple[DataLoader, DataLoader, DataLoader, IMUFeatureExtractor]:
-    df = pd.read_csv(cfg.telemetry_csv)
+def load_data(cfg: Config) -> Tuple[DataLoader, DataLoader, DataLoader, float]:
+    csv_path = Path(cfg.labels_csv)
+    image_dir = Path(cfg.image_dir)
 
-    # Validate required columns
-    required_imu = ["ax", "ay", "az", "gx", "gy", "gz"]
-    missing = [c for c in required_imu if c not in df.columns]
-    if missing:
-        raise ValueError(f"Telemetry CSV missing columns: {missing}")
+    if csv_path.exists():
+        df = pd.read_csv(csv_path)
+        if "image_file" not in df.columns or "label" not in df.columns:
+            raise ValueError("labels.csv must contain image_file and label columns")
+        df = df.copy()
+        df["label"] = df["label"].apply(normalize_binary_label)
+    else:
+        records = []
+        for folder in sorted(p for p in image_dir.iterdir() if p.is_dir()):
+            label = infer_label_from_path(folder)
+            if label is None:
+                continue
+            for image_path in sorted(folder.glob("*.jpg")) + sorted(folder.glob("*.jpeg")) + sorted(folder.glob("*.png")):
+                records.append({"image_file": str(image_path.relative_to(image_dir)), "label": label})
+        if not records:
+            raise FileNotFoundError(
+                f"No labels CSV found at {csv_path} and no labeled subfolders found under {image_dir}. "
+                "Create a labels.csv with columns image_file,label or organize images into pothole/no_pothole folders."
+            )
+        df = pd.DataFrame(records)
 
-    has_labels = "severity_label" in df.columns
+    if len(df) < 3:
+        raise ValueError("Need at least 3 labeled samples to build train/val/test splits")
 
-    # ── Split ─────────────────────────────────────────────────────────
-    idx       = np.arange(len(df))
-    labels    = df["severity_label"].values if has_labels else np.zeros(len(df))
-
-    idx_tv, idx_test = train_test_split(
-        idx, test_size=cfg.test_split, random_state=cfg.seed, shuffle=True
+    stratify = df["label"] if df["label"].nunique() > 1 else None
+    df_train_val, df_test = train_test_split(
+        df, test_size=cfg.test_split, random_state=cfg.seed, shuffle=True, stratify=stratify
     )
-    idx_train, idx_val = train_test_split(
-        idx_tv, test_size=cfg.val_split / (1 - cfg.test_split),
-        random_state=cfg.seed, shuffle=True
+    stratify_train = df_train_val["label"] if df_train_val["label"].nunique() > 1 else None
+    val_ratio = cfg.val_split / (1 - cfg.test_split)
+    df_train, df_val = train_test_split(
+        df_train_val,
+        test_size=val_ratio,
+        random_state=cfg.seed,
+        shuffle=True,
+        stratify=stratify_train,
     )
-
-    df_train = df.iloc[idx_train]
-    df_val   = df.iloc[idx_val]
-    df_test  = df.iloc[idx_test]
 
     log.info(f"Dataset split — Train: {len(df_train)} | Val: {len(df_val)} | Test: {len(df_test)}")
-
-    # ── Feature extractor ─────────────────────────────────────────────
-    extractor = IMUFeatureExtractor(cfg)
-
-    # ── RobustScaler on IMU raw columns (fitted on train only) ────────
-    scaler = RobustScaler()
-    train_raw_imu_cols = df_train[["ax","ay","az","gx","gy","gz"]].values
-    scaler.fit(train_raw_imu_cols)
-    df_train = df_train.copy()
-    df_val   = df_val.copy()
-    df_test  = df_test.copy()
-    df_train[["ax","ay","az","gx","gy","gz"]] = scaler.transform(df_train[["ax","ay","az","gx","gy","gz"]].values)
-    df_val[["ax","ay","az","gx","gy","gz"]]   = scaler.transform(df_val[["ax","ay","az","gx","gy","gz"]].values)
-    df_test[["ax","ay","az","gx","gy","gz"]]  = scaler.transform(df_test[["ax","ay","az","gx","gy","gz"]].values)
 
     t_transform = build_train_transform(cfg.img_size)
     v_transform = build_val_transform(cfg.img_size)
 
-    ds_train = PotholeDataset(df_train, cfg.image_dir, extractor, t_transform, cfg, is_train=True)
-    ds_val   = PotholeDataset(df_val,   cfg.image_dir, extractor, v_transform, cfg, is_train=False)
-    ds_test  = PotholeDataset(df_test,  cfg.image_dir, extractor, v_transform, cfg, is_train=False)
+    ds_train = PotholeDataset(df_train, cfg.image_dir, t_transform, cfg, is_train=True)
+    ds_val = PotholeDataset(df_val, cfg.image_dir, v_transform, cfg, is_train=False)
+    ds_test = PotholeDataset(df_test, cfg.image_dir, v_transform, cfg, is_train=False)
 
-    sampler = build_weighted_sampler(labels[idx_train])
+    sampler = build_weighted_sampler(df_train["label"].to_numpy())
 
     dl_train = DataLoader(
-        ds_train, batch_size=cfg.batch_size, sampler=sampler,
-        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory, drop_last=True,
+        ds_train,
+        batch_size=cfg.batch_size,
+        sampler=sampler,
+        num_workers=cfg.num_workers,
+        pin_memory=cfg.pin_memory,
+        drop_last=True,
     )
-    dl_val  = DataLoader(
-        ds_val, batch_size=cfg.batch_size * 2, shuffle=False,
-        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
+    dl_val = DataLoader(
+        ds_val,
+        batch_size=cfg.batch_size * 2,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=cfg.pin_memory,
     )
     dl_test = DataLoader(
-        ds_test, batch_size=cfg.batch_size * 2, shuffle=False,
-        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
+        ds_test,
+        batch_size=cfg.batch_size * 2,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=cfg.pin_memory,
     )
 
-    return dl_train, dl_val, dl_test, extractor
+    pos = max(int(df_train["label"].sum()), 1)
+    neg = max(int((1 - df_train["label"]).sum()), 1)
+    pos_weight = float(neg / pos)
+    return dl_train, dl_val, dl_test, pos_weight
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -830,18 +718,21 @@ def train_one_epoch(
     cfg:       Config,
 ) -> Dict[str, float]:
     model.train()
-    total_loss, total_mae, n = 0.0, 0.0, 0
+    total_loss = 0.0
+    all_logits: List[np.ndarray] = []
+    all_targets: List[np.ndarray] = []
+    n = 0
+    amp_enabled = cfg.use_amp and device.type == "cuda"
 
     for batch in loader:
         img  = batch["image"].to(device, non_blocking=True)
-        imu  = batch["imu"].to(device,   non_blocking=True)
-        tgt  = batch["severity"].to(device, non_blocking=True)
+        tgt  = batch["label"].to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast(enabled=cfg.use_amp):
-            pred = model(img, imu)
-            loss = criterion(pred, tgt)
+        with autocast(enabled=amp_enabled):
+            logits = model(img)
+            loss = criterion(logits, tgt)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -851,10 +742,15 @@ def train_one_epoch(
 
         bs         = tgt.size(0)
         total_loss += loss.item() * bs
-        total_mae  += torch.abs(pred.detach() - tgt).sum().item()
         n          += bs
+        all_logits.append(logits.detach().cpu().numpy())
+        all_targets.append(tgt.detach().cpu().numpy())
 
-    return {"loss": total_loss / n, "MAE": total_mae / n}
+    logits_np = np.concatenate(all_logits)
+    targets_np = np.concatenate(all_targets)
+    metrics = compute_metrics(logits_np, targets_np, threshold=cfg.threshold)
+    metrics["loss"] = total_loss / n
+    return metrics
 
 
 @torch.no_grad()
@@ -867,24 +763,24 @@ def evaluate(
 ) -> Dict[str, float]:
     model.eval()
     total_loss, n = 0.0, 0
-    all_preds, all_tgts = [], []
+    all_logits, all_tgts = [], []
+    amp_enabled = cfg.use_amp and device.type == "cuda"
 
     for batch in loader:
         img  = batch["image"].to(device, non_blocking=True)
-        imu  = batch["imu"].to(device,   non_blocking=True)
-        tgt  = batch["severity"].to(device, non_blocking=True)
+        tgt  = batch["label"].to(device, non_blocking=True)
 
-        with autocast(enabled=cfg.use_amp):
-            pred = model(img, imu)
-            loss = criterion(pred, tgt)
+        with autocast(enabled=amp_enabled):
+            logits = model(img)
+            loss = criterion(logits, tgt)
 
         bs         = tgt.size(0)
         total_loss += loss.item() * bs
         n          += bs
-        all_preds.append(pred.cpu().numpy())
+        all_logits.append(logits.cpu().numpy())
         all_tgts.append(tgt.cpu().numpy())
 
-    preds   = np.concatenate(all_preds)
+    preds   = np.concatenate(all_logits)
     targets = np.concatenate(all_tgts)
     metrics = compute_metrics(preds, targets)
     metrics["loss"] = total_loss / n
@@ -928,46 +824,53 @@ def train(cfg: Config = CFG):
     Path(cfg.checkpoint_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.log_dir).mkdir(parents=True, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info(f"Using device: {device}")
+    device = get_best_device()
+    log.info(
+        "Apple MPS detected: %s | Using device: %s | AMP: %s",
+        "yes" if device.type == "mps" else "no",
+        device,
+        "enabled" if device_supports_amp(device) and cfg.use_amp else "disabled",
+    )
 
     # ── Data ──────────────────────────────────────────────────────────
-    dl_train, dl_val, dl_test, extractor = load_data(cfg)
+    dl_train, dl_val, dl_test, pos_weight = load_data(cfg)
 
     # ── Model ─────────────────────────────────────────────────────────
-    model = PotholeNet(
-        imu_feature_dim=extractor.feature_dim,
-        cfg=cfg,
-    ).to(device)
+    model = PotholeNet(cfg).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info(f"Trainable parameters: {n_params:,}")
 
     # ── Loss, Optimizer, Scheduler ────────────────────────────────────
-    criterion = build_loss(cfg)
-    # Differential learning rate to preserve pre-trained backbone features
+    pos_weight_tensor = torch.tensor([pos_weight], dtype=torch.float32, device=device)
+    criterion = build_loss(pos_weight=pos_weight_tensor)
+
     backbone_params = []
-    other_params = []
+    head_params = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         if "vision_enc.backbone" in name:
             backbone_params.append(param)
         else:
-            other_params.append(param)
-            
-    optimizer = AdamW([
-        {"params": backbone_params, "lr": cfg.lr * 0.1},
-        {"params": other_params, "lr": cfg.lr}
-    ], weight_decay=cfg.weight_decay, betas=(0.9, 0.999))
+            head_params.append(param)
+
+    optimizer = AdamW(
+        [
+            {"params": backbone_params, "lr": cfg.lr * 0.1},
+            {"params": head_params, "lr": cfg.lr},
+        ],
+        weight_decay=cfg.weight_decay,
+        betas=(0.9, 0.999),
+    )
     
     scheduler    = WarmupCosineScheduler(optimizer, cfg)
-    amp_scaler   = GradScaler(enabled=cfg.use_amp)
+    amp_scaler   = GradScaler(enabled=device.type == "cuda" and cfg.use_amp)
     early_stop   = EarlyStopping(patience=150)
 
     writer = SummaryWriter(cfg.log_dir) if HAS_TB else None
 
-    best_val_mae  = float("inf")
+    best_val_f1   = float("-inf")
     best_ckpt     = Path(cfg.checkpoint_dir) / "best_model.pt"
 
     # ── Training loop ─────────────────────────────────────────────────
@@ -984,33 +887,35 @@ def train(cfg: Config = CFG):
 
         log.info(
             f"Epoch {epoch:3d}/{cfg.epochs} | "
-            f"Train Loss={train_m['loss']:.4f} MAE={train_m['MAE']:.4f} | "
-            f"Val   Loss={val_m['loss']:.4f}  MAE={val_m['MAE']:.4f}  "
-            f"W1%={val_m['Within1%']:.1f}  ρ={val_m['SpearmanRho']:.3f} | "
+            f"Train Loss={train_m['loss']:.4f} Acc={train_m['Accuracy']:.3f} F1={train_m['F1']:.3f} | "
+            f"Val   Loss={val_m['loss']:.4f}  Acc={val_m['Accuracy']:.3f}  F1={val_m['F1']:.3f}  "
+            f"Prec={val_m['Precision']:.3f} Rec={val_m['Recall']:.3f} AUC={val_m['AUC']:.3f} | "
             f"LR={lr_now:.2e} | {elapsed:.1f}s"
         )
 
         # TensorBoard
         if writer:
             writer.add_scalars("Loss",    {"train": train_m["loss"],  "val": val_m["loss"]}, epoch)
-            writer.add_scalars("MAE",     {"train": train_m["MAE"],   "val": val_m["MAE"]},  epoch)
-            writer.add_scalar("Val/Within1pct",   val_m["Within1%"],       epoch)
-            writer.add_scalar("Val/SpearmanRho",  val_m["SpearmanRho"],    epoch)
+            writer.add_scalars("Accuracy", {"train": train_m["Accuracy"], "val": val_m["Accuracy"]}, epoch)
+            writer.add_scalars("F1",       {"train": train_m["F1"],       "val": val_m["F1"]}, epoch)
+            writer.add_scalar("Val/Precision", val_m["Precision"], epoch)
+            writer.add_scalar("Val/Recall",    val_m["Recall"],    epoch)
+            writer.add_scalar("Val/AUC",       val_m["AUC"],       epoch)
             writer.add_scalar("LR",               lr_now,                  epoch)
 
         # Save best checkpoint
-        if val_m["MAE"] < best_val_mae:
-            best_val_mae = val_m["MAE"]
+        if val_m["F1"] > best_val_f1:
+            best_val_f1 = val_m["F1"]
             torch.save({
                 "epoch":          epoch,
                 "model_state":    model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
-                "val_mae":        best_val_mae,
+                "val_f1":         best_val_f1,
                 "cfg":            cfg,
             }, best_ckpt)
-            log.info(f"  ✓ New best checkpoint saved (Val MAE={best_val_mae:.4f})")
+            log.info(f"  ✓ New best checkpoint saved (Val F1={best_val_f1:.4f})")
 
-        if early_stop(val_m["MAE"]):
+        if early_stop(-val_m["F1"]):
             log.info(f"Early stopping triggered at epoch {epoch}")
             break
 
@@ -1023,8 +928,8 @@ def train(cfg: Config = CFG):
     model.load_state_dict(ckpt["model_state"])
     test_m = evaluate(model, dl_test, criterion, device, cfg)
     log.info(
-        f"Test MAE={test_m['MAE']:.4f} | RMSE={test_m['RMSE']:.4f} | "
-        f"Within-1={test_m['Within1%']:.1f}% | Spearman-ρ={test_m['SpearmanRho']:.3f}"
+        f"Test Acc={test_m['Accuracy']:.3f} | Prec={test_m['Precision']:.3f} | "
+        f"Rec={test_m['Recall']:.3f} | F1={test_m['F1']:.3f} | AUC={test_m['AUC']:.3f}"
     )
 
     return model, test_m
@@ -1034,80 +939,67 @@ def train(cfg: Config = CFG):
 # 18. INFERENCE  (production scoring)
 # ──────────────────────────────────────────────────────────────────────────────
 class PotholeScorer:
-    """
-    Production-ready inference wrapper.
-
-    Usage:
-        scorer = PotholeScorer("checkpoints/best_model.pt")
-        score  = scorer.predict("images/00123.jpg", imu_window_np)
-        # score ∈ [1.0, 10.0]
-    """
-
-    SEVERITY_LABELS = {
-        (1.0, 2.5):  ("MINOR",    "Small surface imperfection, no action needed"),
-        (2.5, 4.5):  ("MODERATE", "Noticeable bump, monitor for worsening"),
-        (4.5, 6.5):  ("SERIOUS",  "Significant pothole, schedule maintenance"),
-        (6.5, 8.5):  ("SEVERE",   "Large crater, urgent repair required"),
-        (8.5, 10.1): ("CRITICAL", "Dangerous road hazard, immediate closure"),
-    }
+    """Production-ready image-only pothole classifier."""
 
     def __init__(self, checkpoint_path: str, device: Optional[str] = None):
         if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = get_best_device().type
         self.device = torch.device(device)
+        # Some checkpoints were saved when this file was executed as __main__.
+        # That causes pickle to look for classes (like Config) under module '__main__',
+        # which breaks when importing this module. Workaround: temporarily map
+        # '__main__' to this module so unpickling can resolve the dataclass.
+        import sys
 
-        ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        orig_main = sys.modules.get("__main__")
+        sys.modules["__main__"] = sys.modules.get(__name__)
+        try:
+            ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        finally:
+            # restore previous __main__ mapping
+            if orig_main is not None:
+                sys.modules["__main__"] = orig_main
+            else:
+                try:
+                    del sys.modules["__main__"]
+                except KeyError:
+                    pass
         cfg  = ckpt["cfg"]
-        self.extractor = IMUFeatureExtractor(cfg)
-
-        self.model = PotholeNet(
-            imu_feature_dim=self.extractor.feature_dim,
-            cfg=cfg,
-        ).to(self.device)
+        self.model = PotholeNet(cfg).to(self.device)
         self.model.load_state_dict(ckpt["model_state"])
         self.model.eval()
 
         self.transform = build_val_transform(cfg.img_size)
+        self.threshold = getattr(cfg, "threshold", 0.5)
 
     @torch.no_grad()
     def predict(
         self,
-        image_path:  str,
-        imu_window:  np.ndarray,
-        return_label: bool = True,
+        image_path: str,
+        threshold: Optional[float] = None,
     ) -> Dict:
-        # Image
-        img    = np.array(Image.open(image_path).convert("RGB"))
-        img_t  = self.transform(image=img)["image"].unsqueeze(0).to(self.device)
+        img = np.array(Image.open(image_path).convert("RGB"))
+        img_t = self.transform(image=img)["image"].unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            logit = self.model(img_t)
+            prob = torch.sigmoid(logit).item()
 
-        # IMU features
-        feats  = self.extractor.extract(imu_window)
-        imu_t  = torch.from_numpy(feats).unsqueeze(0).to(self.device)
-
-        with autocast(enabled=True):
-            score = self.model(img_t, imu_t).item()
-
-        result = {"score": round(score, 2)}
-
-        if return_label:
-            for (lo, hi), (label, desc) in self.SEVERITY_LABELS.items():
-                if lo <= score < hi:
-                    result["severity"]    = label
-                    result["description"] = desc
-                    break
-
-        return result
+        thr = self.threshold if threshold is None else threshold
+        pred = int(prob >= thr)
+        return {
+            "probability": round(prob, 4),
+            "threshold": round(thr, 4),
+            "label": "POTHOLE" if pred else "NO_POTHOLE",
+            "predicted_class": pred,
+        }
 
     @torch.no_grad()
     def predict_batch(
         self,
         image_paths: List[str],
-        imu_windows: List[np.ndarray],
+        threshold: Optional[float] = None,
     ) -> List[Dict]:
-        return [
-            self.predict(p, w)
-            for p, w in zip(image_paths, imu_windows)
-        ]
+        return [self.predict(p, threshold=threshold) for p in image_paths]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1116,60 +1008,44 @@ class PotholeScorer:
 def generate_synthetic_dataset(
     n_samples:  int   = 500,
     image_dir:  str   = "data/images",
-    csv_path:   str   = "data/telemetry.csv",
+    csv_path:   str   = "data/labels.csv",
     seed:       int   = 42,
 ):
     """
-    Creates dummy JPG images (random noise) and telemetry CSV
-    so you can run train() end-to-end immediately without real hardware.
-
-    Severity distribution is intentionally imbalanced (right-skewed)
-    to mimic real road conditions.
+    Creates dummy JPG images and a binary labels CSV so you can smoke-test
+    the CNN training pipeline without real annotations.
     """
     import os
     os.makedirs(image_dir, exist_ok=True)
     rng = np.random.default_rng(seed)
 
-    # Imbalanced severity: most samples are 2-5, rare are 8-10
-    severities = rng.choice(
-        np.arange(1.0, 10.1, 0.5),
-        size=n_samples,
-        p=np.array([
-            3,5,8,12,15,15,12,8,6,5,
-            4,3,3,2,2,2,1,1,1,1
-        ], dtype=float) / 100.0
-    ).clip(1.0, 10.0)
-
     rows = []
-    for i, sev in enumerate(severities):
-        ts = 1718000000 + i * 100
-        # Higher severity → larger Z acceleration spike
-        az_spike = 0.5 + sev * 0.8 + rng.normal(0, 0.3)
+    for i in range(n_samples):
+        label = int(rng.random() > 0.55)
         rows.append({
-            "timestamp":      ts,
-            "ax":             rng.normal(0.0, 0.2),
-            "ay":             rng.normal(0.0, 0.2),
-            "az":             az_spike,
-            "gx":             rng.normal(0.0, 0.05),
-            "gy":             rng.normal(0.0, 0.05),
-            "gz":             rng.normal(0.0, 0.05),
-            "severity_label": round(float(sev), 1),
-            "image_file":     f"{i:04d}.jpg",
+            "image_file": f"{i:04d}.jpg",
+            "label": label,
         })
 
-        # Generate dummy image (random noise resembling road)
-        img_np = rng.integers(50, 180, size=(96, 96, 3), dtype=np.uint8)
-        # Add fake crack lines for high-severity
-        if sev > 6:
-            for _ in range(int(sev)):
-                r = rng.integers(0, 90)
-                img_np[r:r+3, :, :] = rng.integers(20, 60, size=(3, 96, 3), dtype=np.uint8)
+        img_np = rng.integers(60, 180, size=(128, 128, 3), dtype=np.uint8)
+        if label == 1:
+            for _ in range(rng.integers(3, 8)):
+                y = rng.integers(20, 110)
+                thickness = rng.integers(2, 5)
+                img_np[y:y + thickness, :, :] = rng.integers(10, 50, size=(thickness, 128, 3), dtype=np.uint8)
+            for _ in range(rng.integers(1, 4)):
+                x = rng.integers(15, 110)
+                y = rng.integers(30, 95)
+                radius = rng.integers(5, 18)
+                yy, xx = np.ogrid[:128, :128]
+                mask = (xx - x) ** 2 + (yy - y) ** 2 <= radius ** 2
+                img_np[mask] = rng.integers(20, 70, size=3, dtype=np.uint8)
         Image.fromarray(img_np).save(f"{image_dir}/{i:04d}.jpg")
 
     df = pd.DataFrame(rows)
     df.to_csv(csv_path, index=False)
     log.info(f"Synthetic dataset: {n_samples} samples written to {csv_path}")
-    log.info(f"Severity distribution:\n{pd.cut(df['severity_label'], bins=5).value_counts().sort_index()}")
+    log.info(f"Label distribution:\n{df['label'].value_counts().sort_index()}")
     return df
 
 
@@ -1179,26 +1055,32 @@ def generate_synthetic_dataset(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Multimodal Pothole Severity Scorer")
+    parser = argparse.ArgumentParser(description="Image-only pothole classifier")
     parser.add_argument("--mode",     type=str, default="train",
                         choices=["train", "infer", "synth"],
                         help="'train': run training | 'infer': single inference | 'synth': generate synthetic data")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt")
     parser.add_argument("--image",      type=str, default=None)
-    parser.add_argument("--csv_row",    type=int, default=0,
-                        help="Row index in telemetry CSV to use as IMU window centre for inference")
+    parser.add_argument("--labels_csv", type=str, default=CFG.labels_csv)
+    parser.add_argument("--image_dir", type=str, default=CFG.image_dir)
+    parser.add_argument("--threshold", type=float, default=CFG.threshold)
+    parser.add_argument("--epochs", type=int, default=CFG.epochs)
     parser.add_argument("--synth_n",   type=int, default=500)
     args = parser.parse_args()
 
+    CFG.labels_csv = args.labels_csv
+    CFG.image_dir = args.image_dir
+    CFG.threshold = args.threshold
+    CFG.epochs = args.epochs
+
     if args.mode == "synth":
-        generate_synthetic_dataset(n_samples=args.synth_n)
+        generate_synthetic_dataset(n_samples=args.synth_n, image_dir=args.image_dir, csv_path=args.labels_csv)
         log.info("Synthetic dataset generated. Run with --mode train to start training.")
 
     elif args.mode == "train":
-        # Quick-start: generate synthetic data if no real data present
-        if not Path(CFG.telemetry_csv).exists():
-            log.warning("No telemetry.csv found. Generating synthetic dataset for demo...")
-            generate_synthetic_dataset(n_samples=500)
+        if not Path(CFG.labels_csv).exists():
+            log.warning("No labels.csv found. Generating synthetic dataset for demo...")
+            generate_synthetic_dataset(n_samples=500, image_dir=CFG.image_dir, csv_path=CFG.labels_csv)
         train(CFG)
 
     elif args.mode == "infer":
@@ -1207,19 +1089,12 @@ if __name__ == "__main__":
             sys.exit(1)
 
         scorer = PotholeScorer(args.checkpoint)
-        df_tel = pd.read_csv(CFG.telemetry_csv)
-
-        # Build a window centred on the requested row
-        half   = CFG.imu_window_size // 2
-        lo     = max(0, args.csv_row - half)
-        hi     = min(len(df_tel), args.csv_row + half)
-        window = df_tel.iloc[lo:hi][["ax","ay","az","gx","gy","gz"]].values.astype(np.float32)
-
-        img_path = args.image or (Path(CFG.image_dir) / f"{args.csv_row:04d}.jpg")
-        result   = scorer.predict(str(img_path), window)
+        if args.image is None:
+            raise SystemExit("--image is required in infer mode")
+        result   = scorer.predict(str(args.image), threshold=args.threshold)
 
         print("\n" + "="*50)
-        print(f"  POTHOLE SEVERITY SCORE:  {result['score']:.2f} / 10.0")
-        print(f"  CLASS:                   {result.get('severity', 'N/A')}")
-        print(f"  DESCRIPTION:             {result.get('description', '')}")
+        print(f"  POTHOLE PROBABILITY:     {result['probability']:.4f}")
+        print(f"  THRESHOLD:               {result['threshold']:.2f}")
+        print(f"  CLASS:                   {result['label']}")
         print("="*50 + "\n")
