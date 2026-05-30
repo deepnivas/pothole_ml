@@ -20,9 +20,31 @@ The system is designed for vehicle-mounted edge hardware (ESP32-CAM + MPU6050) c
 
 ## 🧠 Dual Model Architecture
 
-### Model 1: Multimodal Cross-Attention System (`pothole_multimodal_system.py`)
+### Model 1A: CNN Image-Only Classifier (`pothole_multimodal_system.py` - CNN mode)
 
-**Purpose**: High-precision severity scoring by fusing visual and kinematic data.
+**Purpose**: Fast image-only pothole classification using ConvNeXt-Tiny.
+
+**Architecture**:
+- **Vision Backbone**: ConvNeXt-Tiny (29M parameters)
+  - Extracts spatial features from road images
+  - Pre-trained on ImageNet, fine-tuned on pothole binary labels
+  
+- **Regression Head**: Linear layers + sigmoid
+  - Outputs binary classification: pothole vs. no-pothole
+  - Supports continuous confidence scores [0.0, 1.0]
+
+**Training Setup**:
+- Optimizer: AdamW
+- Loss: Binary Cross-Entropy or Focal Loss
+- Scheduler: Cosine Annealing
+- Input: Image file + binary label (0/1, true/false, positive/negative)
+- **NO IMU data required**
+
+---
+
+### Model 1B: Multimodal Cross-Attention System (Advanced, IMU-enabled)
+
+**Purpose**: High-precision severity scoring by fusing visual and kinematic data (requires hardware).
 
 **Architecture**:
 - **Vision Backbone**: ConvNeXt-Tiny (29M parameters) with differential learning rate (2e-5)
@@ -152,31 +174,31 @@ The system is designed for vehicle-mounted edge hardware (ESP32-CAM + MPU6050) c
 The system uses FastAPI for backend inference with structured request/response handling:
 
 **Prediction Flow**:
-1. **Request**: Client sends image + optional IMU telemetry via HTTP POST
+1. **Request**: Client sends image (± optional IMU telemetry) via HTTP POST
 2. **Processing**: 
    - Image decoded and pre-processed (resize, normalize)
-   - IMU data validated and normalized
-   - Both models run in parallel or sequentially
+   - IMU data validated and normalized (if provided)
+   - Models run in parallel or sequentially
 3. **Response**: JSON with severity scores, confidence, mask overlay (base64), and metadata
 
 **API Endpoints (Production Ready)**:
 
 ```python
-# POST /predict/multimodal
+# POST /predict/cnn
+# Image-only fast inference (CNN model, no IMU needed)
 {
-  "image_base64": "...",
-  "imu_data": [[ax1, ay1, az1, gx1, gy1, gz1], ...],  # 50 samples
-  "return_overlay": true
+  "image_base64": "..."
 }
 Response:
 {
-  "severity_score": 7.3,
+  "model": "cnn",
+  "prediction": "pothole" or "no_pothole",
   "confidence": 0.92,
-  "description": "High severity pothole - significant road damage",
-  "processing_time_ms": 125
+  "processing_time_ms": 40
 }
 
 # POST /predict/segmentation
+# Pixel-level pothole localization (DeepLabV3+ model, image-only)
 {
   "image_base64": "...",
   "return_overlay": true
@@ -190,20 +212,36 @@ Response:
   "processing_time_ms": 85
 }
 
-# POST /predict/ensemble
+# POST /predict/multimodal
+# High-precision with motion data (Multimodal model, REQUIRES IMU)
 {
   "image_base64": "...",
-  "imu_data": [...],
+  "imu_data": [[ax1, ay1, az1, gx1, gy1, gz1], ...],  # 50 samples required
+  "return_overlay": true
+}
+Response:
+{
+  "severity_score": 7.3,
+  "confidence": 0.92,
+  "description": "High severity pothole - significant road damage",
+  "processing_time_ms": 120
+}
+
+# POST /predict/ensemble
+# Combines all available models for best result
+{
+  "image_base64": "...",
+  "imu_data": [...],  # optional
   "fusion_strategy": "weighted_average"  # or "max", "voting"
 }
 Response:
 {
-  "multimodal_score": 7.3,
+  "cnn_score": 0.88,
   "segmentation_score": 6.8,
-  "ensemble_score": 7.05,
-  "scores_source": "both_models",
-  "mask_overlay": "...",
-  "processing_time_ms": 210
+  "multimodal_score": 7.3,
+  "ensemble_score": 7.1,
+  "models_used": ["cnn", "segmentation", "multimodal"],
+  "processing_time_ms": 245
 }
 ```
 
@@ -273,11 +311,11 @@ python pothole_deeplabv3plus.py --train --epochs 50 --batch-size 16 --checkpoint
 
 **CLI Prediction**:
 ```bash
-# Use segmentation model
-python predict_seg.py --image road_photo.jpg --model segmentation
-
-# Use multimodal model (CNN only, no IMU)
+# Use CNN model (image-only, fastest)
 python predict_seg.py --image road_photo.jpg --model cnn
+
+# Use segmentation model (image-only, spatial localization)
+python predict_seg.py --image road_photo.jpg --model segmentation
 ```
 
 **Interactive Gradio UI**:
@@ -290,16 +328,21 @@ python predict_seg.py --serve --share
 from pothole_multimodal_system import PotholeScorer
 from pothole_deeplabv3plus import PotholeSegmentationService
 
-# Multimodal scoring
-scorer = PotholeScorer("checkpoints/best_model.pt")
-imu_data = np.random.normal(0, 0.1, (50, 6))  # Simulated IMU
-result = scorer.predict("road.jpg", imu_data)
-print(f"Severity: {result['score']:.2f}/10.0")
+# CNN scoring (image-only, fast)
+scorer = PotholeScorer("checkpoints/best_model.pt", use_imu=False)
+result = scorer.predict("road.jpg")  # No IMU needed
+print(f"Prediction: {result['label']}, Confidence: {result['probability']:.4f}")
 
-# Segmentation
+# Segmentation (image-only, spatial)
 segmenter = PotholeSegmentationService("checkpoints/pothole_deeplabv3plus.pt")
 mask_result = segmenter.predict_with_details("road.jpg")
 print(f"Mask area: {mask_result['mask_area_ratio']:.2%}")
+
+# Multimodal (requires IMU data - vehicle-mounted only)
+scorer_multimodal = PotholeScorer("checkpoints/best_model.pt", use_imu=True)
+imu_data = np.random.normal(0, 0.1, (50, 6))  # Real IMU data from ESP32
+result_mm = scorer_multimodal.predict("road.jpg", imu_data)
+print(f"Severity: {result_mm['score']:.2f}/10.0")
 ```
 
 ---
@@ -308,26 +351,43 @@ print(f"Mask area: {mask_result['mask_area_ratio']:.2%}")
 
 ### Complementary Strengths
 
-| Aspect | Multimodal | Segmentation |
-|--------|-----------|--------------|
-| **Input** | Image + IMU (6-axis motion) | Image only |
-| **Output** | Continuous score (1-10) | Pixel mask + area-based score |
-| **Strength** | Captures impact severity via vibration | Precise spatial localization |
-| **Weakness** | Requires synchronized IMU hardware | Less sensitive to impact intensity |
-| **Use Case** | Vehicle-mounted edge deployment | Road condition mapping, GIS analysis |
+| Aspect | CNN (Image-Only) | Segmentation | Multimodal (IMU+Vision) |
+|--------|------------------|--------------|------------------------|
+| **Input** | Image only | Image only | Image + IMU (6-axis) |
+| **Output** | Binary class or confidence | Pixel mask + area score | Continuous severity (1-10) |
+| **Processing Speed** | ~40ms | ~80ms | ~120ms (with IMU) |
+| **Hardware Required** | Camera only | Camera only | Camera + IMU sensor |
+| **Strength** | Fast, lightweight, no extra hardware | Precise spatial localization | Captures impact intensity via vibration |
+| **Weakness** | No spatial info, less nuanced | No motion/impact info | Requires synchronized IMU |
+| **Best For** | Real-time edge deployment | GIS mapping, road surveys | Vehicle-mounted continuous monitoring |
 
 ### Ensemble Strategy
 
-In production, combine both models:
-1. **Multimodal score** = Primary signal (hardware equipped)
-2. **Segmentation score** = Fallback or validation (image-only)
-3. **Ensemble score** = Weighted average or max of both
+Three models working together for robust pothole detection:
 
+1. **CNN (Image-Only)** = Fast baseline (40ms)
+   - Always available
+   - Binary classification or confidence score
+   
+2. **Segmentation** = Spatial reference (80ms)
+   - Provides pixel-level masks
+   - Area-based severity scoring
+   
+3. **Multimodal** = Impact detection (120ms, when IMU available)
+   - Primary signal for vehicle-mounted systems
+   - Captures severity via vibration patterns
+
+**Scoring Logic**:
 ```python
-if imu_available:
-    score = 0.7 * multimodal_score + 0.3 * segmentation_score
+if imu_available and has_imu_data:
+    # Vehicle-mounted deployment with sensors
+    score = 0.5 * multimodal_score + 0.35 * segmentation_score + 0.15 * cnn_confidence
+elif segmentation_available:
+    # Image-based analysis without IMU
+    score = 0.6 * segmentation_score + 0.4 * cnn_confidence
 else:
-    score = segmentation_score
+    # Fallback: CNN only
+    score = cnn_confidence
 ```
 
 ---
