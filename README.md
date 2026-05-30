@@ -1,7 +1,7 @@
 # 🚗 Pothole Detection & Severity Assessment System
 
 A comprehensive machine learning system for detecting and classifying potholes using two complementary deep learning models:
-1. **Multimodal Cross-Attention System** (Vision + IMU telemetry fusion)
+1. **CNN Image Classifier** (Vision-only)
 2. **DeepLabV3+ Segmentation Model** (Visual segmentation with severity scoring)
 
 ---
@@ -10,17 +10,17 @@ A comprehensive machine learning system for detecting and classifying potholes u
 
 This repository implements a production-ready pothole detection pipeline with two parallel ML backends:
 
-- **Model 1: Multimodal Severity Scorer** - Fuses ESP32-CAM vision with IMU telemetry via cross-attention for continuous severity scores (1.0-10.0)
+- **Model 1: CNN Severity Scorer** - Fast image-only pothole classification and confidence scoring
 - **Model 2: DeepLabV3+ Segmentation** - Generates pixel-level pothole masks and derives severity from mask area ratios
 - **Unified API Layer** - FastAPI + Gradio interface for real-time inference and interactive prediction
 
-The system is designed for vehicle-mounted edge hardware (ESP32-CAM + MPU6050) communicating with a central inference server.
+The system is designed for camera-mounted deployments communicating with a central inference server.
 
 ---
 
 ## 🧠 Dual Model Architecture
 
-### Model 1A: CNN Image-Only Classifier (`pothole_multimodal_system.py` - CNN mode)
+### Model 1: CNN Image Classifier (`pothole_multimodal_system.py` - CNN mode)
 
 **Purpose**: Fast image-only pothole classification using ConvNeXt-Tiny.
 
@@ -38,51 +38,6 @@ The system is designed for vehicle-mounted edge hardware (ESP32-CAM + MPU6050) c
 - Loss: Binary Cross-Entropy or Focal Loss
 - Scheduler: Cosine Annealing
 - Input: Image file + binary label (0/1, true/false, positive/negative)
-- **NO IMU data required**
-
----
-
-### Model 1B: Multimodal Cross-Attention System (Advanced, IMU-enabled)
-
-**Purpose**: High-precision severity scoring by fusing visual and kinematic data (requires hardware).
-
-**Architecture**:
-- **Vision Backbone**: ConvNeXt-Tiny (29M parameters) with differential learning rate (2e-5)
-  - Extracts spatial features from road images
-  - Pre-trained on ImageNet, fine-tuned on pothole data
-  
-- **IMU Encoder**: 2-layer residual MLP
-  - Processes 50 samples of 6-axis telemetry (ax, ay, az, gx, gy, gz)
-  - Computes temporal features, spectral features (FFT), and energy metrics
-  - Maps 50×6 IMU data → 256-dim latent vectors
-  
-- **Fusion Module**: Bidirectional Multi-Head Cross-Attention
-  - Visual features attend to acceleration spikes (indicates impact)
-  - Motion features attend to visual patterns (road surface quality)
-  - Learned attention weights identify correlations between vision and vibration
-  
-- **Regression Head**: Linear layers + scaled sigmoid
-  - Outputs continuous severity score: [1.0, 10.0]
-  - Uses Huber Loss, Focal MSE, and Wing Loss for robust training
-
-**Loss Functions**:
-- Huber Loss: Robust to outliers
-- Focal MSE: Down-weights easy examples, focuses on hard cases
-- Wing Loss: Smooth gradient for better convergence
-
-**Training Setup**:
-- Optimizer: AdamW with layer-wise differential learning rates
-- Scheduler: Cosine Annealing with warm restarts
-- Epochs: 150 (can be customized)
-- GPU acceleration: CUDA 12.4 support
-
-**Performance Metrics**:
-| Metric | Value | Description |
-|--------|-------|-------------|
-| Test MAE | 1.7704 | Average deviation on [1.0, 10.0] scale |
-| Within-1 Accuracy | 37.3% | Predictions within ±1.0 of true label |
-| Test RMSE | 2.3225 | Root Mean Squared Error |
-| Spearman Correlation (ρ) | 0.044 | Order agreement |
 
 ---
 
@@ -132,11 +87,10 @@ The system is designed for vehicle-mounted edge hardware (ESP32-CAM + MPU6050) c
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    Edge Client (Vehicle)                     │
-│                   ESP32-CAM + MPU6050 IMU                    │
+│                       ESP32-CAM (camera only)                │
 ├─────────────────────────────────────────────────────────────┤
 │  1. Capture JPG frame from camera                            │
-│  2. Collect 50 samples of 6-axis IMU data (ax, ay, az,...)  │
-│  3. Encode as JSON + transmit via HTTP/Wi-Fi                │
+│  2. Encode image as base64/JSON + transmit via HTTP/Wi-Fi    │
 └────────────────┬────────────────────────────────────────────┘
                  │
                  ▼
@@ -148,9 +102,8 @@ The system is designed for vehicle-mounted edge hardware (ESP32-CAM + MPU6050) c
         ┌────────┴────────┐
         ▼                 ▼
    ┌─────────────┐  ┌──────────────┐
-   │  Multimodal │  │ DeepLabV3+   │
-   │  Scorer     │  │ Segmentation │
-   │  (CNN+IMU)  │  │              │
+   │    CNN      │  │ DeepLabV3+   │
+   │  Classifier │  │ Segmentation │
    └─────┬───────┘  └──────┬───────┘
          │                 │
          └────────┬────────┘
@@ -174,10 +127,9 @@ The system is designed for vehicle-mounted edge hardware (ESP32-CAM + MPU6050) c
 The system uses FastAPI for backend inference with structured request/response handling:
 
 **Prediction Flow**:
-1. **Request**: Client sends image (± optional IMU telemetry) via HTTP POST
+1. **Request**: Client sends image via HTTP POST
 2. **Processing**: 
    - Image decoded and pre-processed (resize, normalize)
-   - IMU data validated and normalized (if provided)
    - Models run in parallel or sequentially
 3. **Response**: JSON with severity scores, confidence, mask overlay (base64), and metadata
 
@@ -185,7 +137,7 @@ The system uses FastAPI for backend inference with structured request/response h
 
 ```python
 # POST /predict/cnn
-# Image-only fast inference (CNN model, no IMU needed)
+# Image-only fast inference (CNN model)
 {
   "image_base64": "..."
 }
@@ -198,7 +150,7 @@ Response:
 }
 
 # POST /predict/segmentation
-# Pixel-level pothole localization (DeepLabV3+ model, image-only)
+# Pixel-level pothole localization (DeepLabV3+ model)
 {
   "image_base64": "...",
   "return_overlay": true
@@ -212,36 +164,19 @@ Response:
   "processing_time_ms": 85
 }
 
-# POST /predict/multimodal
-# High-precision with motion data (Multimodal model, REQUIRES IMU)
-{
-  "image_base64": "...",
-  "imu_data": [[ax1, ay1, az1, gx1, gy1, gz1], ...],  # 50 samples required
-  "return_overlay": true
-}
-Response:
-{
-  "severity_score": 7.3,
-  "confidence": 0.92,
-  "description": "High severity pothole - significant road damage",
-  "processing_time_ms": 120
-}
-
 # POST /predict/ensemble
-# Combines all available models for best result
+# Combines CNN + Segmentation for improved results
 {
   "image_base64": "...",
-  "imu_data": [...],  # optional
   "fusion_strategy": "weighted_average"  # or "max", "voting"
 }
 Response:
 {
   "cnn_score": 0.88,
   "segmentation_score": 6.8,
-  "multimodal_score": 7.3,
-  "ensemble_score": 7.1,
-  "models_used": ["cnn", "segmentation", "multimodal"],
-  "processing_time_ms": 245
+  "ensemble_score": 6.9,
+  "models_used": ["cnn", "segmentation"],
+  "processing_time_ms": 120
 }
 ```
 
@@ -251,19 +186,18 @@ Response:
 
 ```
 pothole_ml/
-├── pothole_multimodal_system.py     # Multimodal cross-attention model
+├── pothole_multimodal_system.py     # CNN image classifier (image-only)
 ├── pothole_deeplabv3plus.py         # DeepLabV3+ segmentation model
 ├── predict_seg.py                   # Unified Gradio prediction interface
 ├── prepare_dataset.py               # Dataset preparation from VOC annotations
 ├── requirements.txt                 # Dependencies
 ├── checkpoints/                     # Saved model weights
-│   ├── best_model.pt               # Multimodal model checkpoint
+│   ├── best_model.pt               # CNN classifier checkpoint
 │   └── pothole_deeplabv3plus.pt    # Segmentation model checkpoint
 ├── data/                           # Training data
 │   ├── images/                     # Road images (JPG/PNG)
 │   ├── masks/                      # Segmentation masks (optional)
-│   ├── annotations/                # Pascal VOC XML files
-│   └── telemetry.csv               # Multimodal training labels
+│   └── annotations/                # Pascal VOC XML files
 ├── logs/                           # TensorBoard logs
 └── README.md                       # This file
 ```
@@ -292,12 +226,11 @@ python prepare_dataset.py
 ```
 
 This generates:
-- `data/telemetry.csv` with severity labels and synthetic IMU telemetry
 - Synthetic weak masks from VOC bounding boxes for segmentation training
 
 ### 3. Training Models
 
-**Train Multimodal Model**:
+**Train CNN Model**:
 ```bash
 python pothole_multimodal_system.py --mode train --epochs 150 --batch-size 32 --gpu 0
 ```
@@ -330,19 +263,13 @@ from pothole_deeplabv3plus import PotholeSegmentationService
 
 # CNN scoring (image-only, fast)
 scorer = PotholeScorer("checkpoints/best_model.pt", use_imu=False)
-result = scorer.predict("road.jpg")  # No IMU needed
+result = scorer.predict("road.jpg")  # Image-only
 print(f"Prediction: {result['label']}, Confidence: {result['probability']:.4f}")
 
 # Segmentation (image-only, spatial)
 segmenter = PotholeSegmentationService("checkpoints/pothole_deeplabv3plus.pt")
 mask_result = segmenter.predict_with_details("road.jpg")
 print(f"Mask area: {mask_result['mask_area_ratio']:.2%}")
-
-# Multimodal (requires IMU data - vehicle-mounted only)
-scorer_multimodal = PotholeScorer("checkpoints/best_model.pt", use_imu=True)
-imu_data = np.random.normal(0, 0.1, (50, 6))  # Real IMU data from ESP32
-result_mm = scorer_multimodal.predict("road.jpg", imu_data)
-print(f"Severity: {result_mm['score']:.2f}/10.0")
 ```
 
 ---
@@ -351,19 +278,19 @@ print(f"Severity: {result_mm['score']:.2f}/10.0")
 
 ### Complementary Strengths
 
-| Aspect | CNN (Image-Only) | Segmentation | Multimodal (IMU+Vision) |
-|--------|------------------|--------------|------------------------|
-| **Input** | Image only | Image only | Image + IMU (6-axis) |
-| **Output** | Binary class or confidence | Pixel mask + area score | Continuous severity (1-10) |
-| **Processing Speed** | ~40ms | ~80ms | ~120ms (with IMU) |
-| **Hardware Required** | Camera only | Camera only | Camera + IMU sensor |
-| **Strength** | Fast, lightweight, no extra hardware | Precise spatial localization | Captures impact intensity via vibration |
-| **Weakness** | No spatial info, less nuanced | No motion/impact info | Requires synchronized IMU |
-| **Best For** | Real-time edge deployment | GIS mapping, road surveys | Vehicle-mounted continuous monitoring |
+| Aspect | CNN (Image-Only) | Segmentation |
+|--------|------------------|--------------|
+| **Input** | Image only | Image only |
+| **Output** | Binary class or confidence | Pixel mask + area score |
+| **Processing Speed** | ~40ms | ~80ms |
+| **Hardware Required** | Camera only | Camera only |
+| **Strength** | Fast, lightweight, no extra hardware | Precise spatial localization |
+| **Weakness** | No spatial info, less nuanced | No motion/impact info |
+| **Best For** | Real-time edge deployment | GIS mapping, road surveys |
 
 ### Ensemble Strategy
 
-Three models working together for robust pothole detection:
+Two models working together for robust pothole detection:
 
 1. **CNN (Image-Only)** = Fast baseline (40ms)
    - Always available
@@ -372,21 +299,12 @@ Three models working together for robust pothole detection:
 2. **Segmentation** = Spatial reference (80ms)
    - Provides pixel-level masks
    - Area-based severity scoring
-   
-3. **Multimodal** = Impact detection (120ms, when IMU available)
-   - Primary signal for vehicle-mounted systems
-   - Captures severity via vibration patterns
 
 **Scoring Logic**:
 ```python
-if imu_available and has_imu_data:
-    # Vehicle-mounted deployment with sensors
-    score = 0.5 * multimodal_score + 0.35 * segmentation_score + 0.15 * cnn_confidence
-elif segmentation_available:
-    # Image-based analysis without IMU
+if segmentation_available:
     score = 0.6 * segmentation_score + 0.4 * cnn_confidence
 else:
-    # Fallback: CNN only
     score = cnn_confidence
 ```
 
@@ -401,15 +319,9 @@ else:
    - Normalize with ImageNet statistics
    - Apply augmentations (rotations, brightness, elastic deformations)
 
-2. **IMU Preprocessing**:
-   - Temporal feature extraction (mean, std, max, min over 50 samples)
-   - Spectral features via FFT (dominant frequency, energy bins)
-   - Energy normalization via RobustScaler
-
-3. **Label Generation**:
+2. **Label Generation**:
    - From VOC boxes: pothole_area_ratio → severity_score
    - From bounding boxes: width×height → severity label
-   - Synthetic IMU: Add correlated acceleration spikes to ground truth areas
 
 ### Loss Functions
 
@@ -457,7 +369,6 @@ app = FastAPI(title="Pothole Detection API", version="1.0")
 async def predict_endpoint(
     image: UploadFile,
     model_type: str = "ensemble",
-    imu_data: Optional[List[List[float]]] = None
 ):
     # Validate inputs
     # Run inference on selected model(s)
@@ -468,9 +379,8 @@ async def predict_endpoint(
 ### Performance Optimization
 
 - **GPU Inference Speed**:
-  - Multimodal model: ~50ms per inference (batch=1)
+  - CNN model: ~50ms per inference (batch=1)
   - Segmentation model: ~80ms per inference (batch=1)
-  - Batch inference (32): ~0.5-1.5 TFLOPS utilization
 
 - **Memory Requirements**:
   - Model weights: ~150MB (both models)
@@ -483,51 +393,48 @@ async def predict_endpoint(
 
 ### ESP32-CAM Client Setup
 
-The edge device captures synchronized multimodal data:
+The edge device captures and transmits images:
 
 ```cpp
 // Pseudocode for ESP32
 1. Initialize camera (JPG quality 80%, 640x480)
-2. Initialize MPU6050 IMU (16-bit, ±16g range)
-3. On trigger (motion detected or periodic):
+2. On trigger (motion detected or periodic):
    a. Capture frame → JPEG encode → buffer
-   b. Read 50 IMU samples @ 100Hz → raw 6-axis data
-   c. Create JSON: {image_b64, imu_array, timestamp}
-   d. HTTP POST to server endpoint
-   e. Parse response → display severity on LCD
+   b. Create JSON: {image_b64, timestamp}
+   c. HTTP POST to server endpoint
+   d. Parse response → display severity on LCD
 ```
 
 ### Server Inference Pipeline
 
 ```python
-def infer_pothole(image_bytes, imu_data, model_type="ensemble"):
+def infer_pothole(image_bytes, model_type="ensemble"):
     # 1. Preprocess image
     image = Image.open(BytesIO(image_bytes)).convert("RGB")
     image_tensor = preprocess_vision(image)
     
-    # 2. Preprocess IMU (if available)
-    if imu_data:
-        imu_features = extract_imu_features(imu_data)
-        imu_tensor = torch.tensor(imu_features, dtype=torch.float32)
-    
-    # 3. Run models
-    if model_type in ["ensemble", "multimodal"]:
-        with torch.no_grad():
-            multimodal_score = multimodal_model(image_tensor, imu_tensor)
-    
+    # 2. Run models
     if model_type in ["ensemble", "segmentation"]:
         with torch.no_grad():
             mask = segmentation_model(image_tensor)
             seg_score = compute_severity_from_mask(mask)
     
-    # 4. Combine results
+    if model_type in ["ensemble", "cnn"]:
+        with torch.no_grad():
+            cnn_score = cnn_model(image_tensor)
+    
+    # 3. Combine results
     if model_type == "ensemble":
-        final_score = 0.7 * multimodal_score + 0.3 * seg_score
+        final_score = 0.5 * seg_score + 0.5 * cnn_score
+    elif model_type == "segmentation":
+        final_score = seg_score
+    else:
+        final_score = cnn_score
     
     return {
-        "score": final_score.item(),
+        "score": float(final_score),
         "confidence": compute_confidence(...),
-        "mask": mask,
+        "mask": None if model_type == "cnn" else mask,
         "metadata": {...}
     }
 ```
@@ -569,7 +476,7 @@ UI & Logging:
 3. **FastAPI-ready structure** - Backend architecture prepared for REST API deployment
 
 ### Enhanced Features
-- Dual-model inference capability (multimodal + segmentation)
+- Dual-model inference capability (CNN + segmentation)
 - Gradio interactive interface with model selection
 - Support for checkpoint override in predictions
 - Overlay visualization for both model outputs
@@ -601,7 +508,6 @@ UI & Logging:
 
 - **DeepLabV3+**: Chen et al. "Encoder-Decoder with Atrous Separable Convolution"
 - **ConvNeXt**: Liu et al. "A ConvNet for the 2020s"
-- **Cross-Attention**: Vaswani et al. "Attention Is All You Need"
 - **Segmentation Models PyTorch**: [qubvel/segmentation_models.pytorch](https://github.com/qubvel/segmentation_models.pytorch)
 
 ---
